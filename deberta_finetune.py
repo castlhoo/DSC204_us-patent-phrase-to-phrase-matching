@@ -11,7 +11,11 @@ Metric: Pearson correlation
 import warnings
 warnings.filterwarnings("ignore")
 
-import zipfile, io, os, random, json
+import os
+os.environ["HF_HOME"] = os.path.expanduser("~/.hf_cache")
+os.environ["TRANSFORMERS_CACHE"] = os.path.expanduser("~/.hf_cache/hub")
+
+import zipfile, io, random, json
 import numpy as np
 import pandas as pd
 import torch
