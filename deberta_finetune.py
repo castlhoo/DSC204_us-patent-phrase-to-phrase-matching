@@ -27,10 +27,10 @@ import scipy.stats as stats
 
 # ── 설정 ──────────────────────────────────────────────────────
 CFG = {
-    "model_name"  : "microsoft/deberta-v3-base",
+    "model_name"  : "microsoft/deberta-v3-large",
     "max_length"  : 128,
-    "batch_size"  : 32,
-    "grad_accum"  : 1,
+    "batch_size"  : 16,
+    "grad_accum"  : 2,
     "epochs"      : 5,
     "lr"          : 2e-5,
     "warmup_ratio": 0.1,
@@ -62,12 +62,30 @@ sub   = pd.read_csv(io.BytesIO(z.read("sample_submission.csv")))
 
 print(f"Train: {train.shape}, Test: {test.shape}", flush=True)
 
+# ── CPC 섹션 설명 매핑 ──────────────────────────────────────
+CPC_SECTION = {
+    'A': 'human necessities',
+    'B': 'performing operations transporting',
+    'C': 'chemistry metallurgy',
+    'D': 'textiles paper',
+    'E': 'fixed constructions',
+    'F': 'mechanical engineering lighting heating',
+    'G': 'physics',
+    'H': 'electricity',
+    'Y': 'general tagging new developments',
+}
+
+def expand_cpc(code):
+    section = str(code)[0].upper() if pd.notna(code) and len(str(code)) > 0 else ''
+    return CPC_SECTION.get(section, str(code))
+
 # ── 토크나이저 ────────────────────────────────────────────────
 tokenizer = DebertaV2Tokenizer.from_pretrained(CFG["model_name"])
 
 def tokenize(anchor, target, context, max_len):
-    text_a = context + " " + anchor   # "B60 obstacle course"
-    text_b = target                    # "obstacle position trajectory"
+    cpc_desc = expand_cpc(context)
+    text_a = cpc_desc + " " + anchor   # "human necessities obstacle course"
+    text_b = target                     # "obstacle position trajectory"
     enc = tokenizer(
         text_a,
         text_b,
