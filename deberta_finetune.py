@@ -311,6 +311,8 @@ for fold in CFG["train_folds"]:
 
     if os.path.exists(epoch_ckpt_path):
         os.remove(epoch_ckpt_path)
+    if os.path.exists(best_ckpt_path):
+        os.remove(best_ckpt_path)
 
     print(f"\nFold {fold} 완료. Best pearson={best_pearson:.4f}", flush=True)
 
