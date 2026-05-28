@@ -80,9 +80,15 @@ def tokenize(anchor, target, context, max_len):
 
 # ── Dataset ───────────────────────────────────────────────────
 class PatentDataset(Dataset):
-    def __init__(self, df, is_test=False):
-        self.df      = df.reset_index(drop=True)
+    def __init__(self, df, is_test=False, augment=False):
         self.is_test = is_test
+        if augment and not is_test:
+            swapped = df.copy()
+            swapped["anchor"] = df["target"].values
+            swapped["target"] = df["anchor"].values
+            self.df = pd.concat([df, swapped], ignore_index=True)
+        else:
+            self.df = df.reset_index(drop=True)
 
     def __len__(self):
         return len(self.df)
