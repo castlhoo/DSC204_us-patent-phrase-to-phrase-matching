@@ -1,0 +1,21 @@
+
+# gym-environment
+.claudeignore
+.copilotignore
+.cursorignore
+.cursorrules
+.geminiignore
+.github
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+
+# data & model artifacts
+data/
+*.zip
+*.pt
+*.npy
+*.csv
+checkpoints/
+__pycache__/
+*.pyc
