@@ -36,7 +36,7 @@ CFG = {
     "warmup_ratio": 0.1,
     "seed"        : 42,
     "n_folds"     : 5,
-    "train_folds" : [0],        # 첫 실험: fold 0만. 전체: [0,1,2,3,4]
+    "train_folds" : [0,1,2,3,4],
     "data_path"   : "data/us-patent-phrase-to-phrase-matching.zip",
     "device"      : "cuda" if torch.cuda.is_available() else "cpu",
     "ckpt_dir"    : "checkpoints",
@@ -218,7 +218,7 @@ for fold in CFG["train_folds"]:
     tr_df  = train.iloc[tr_idx]
     val_df = train.iloc[val_idx]
 
-    tr_ds      = PatentDataset(tr_df)
+    tr_ds      = PatentDataset(tr_df, augment=True)
     val_ds     = PatentDataset(val_df)
     tr_loader  = DataLoader(tr_ds,  batch_size=CFG["batch_size"],     shuffle=True,  num_workers=2)
     val_loader = DataLoader(val_ds, batch_size=CFG["batch_size"] * 2, shuffle=False, num_workers=2)
