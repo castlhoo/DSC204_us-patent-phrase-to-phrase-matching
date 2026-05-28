@@ -15,6 +15,7 @@ import os
 os.environ["HF_HOME"] = os.path.expanduser("~/.hf_cache")
 os.environ["TRANSFORMERS_CACHE"] = os.path.expanduser("~/.hf_cache/hub")
 
+import gc
 import zipfile, io, random, json
 import numpy as np
 import pandas as pd
@@ -32,10 +33,10 @@ import scipy.stats as stats
 # ── 설정 ──────────────────────────────────────────────────────
 CFG = {
     "model_name"  : "microsoft/deberta-v3-large",
-    "max_length"  : 128,
+    "max_length"  : 96,
     "batch_size"  : 8,
     "grad_accum"  : 4,
-    "epochs"      : 5,
+    "epochs"      : 4,
     "lr"          : 2e-5,
     "warmup_ratio": 0.1,
     "seed"        : 42,
@@ -56,6 +57,7 @@ def seed_everything(seed):
     torch.cuda.manual_seed_all(seed)
 
 seed_everything(CFG["seed"])
+torch.backends.cudnn.benchmark = True
 print(f"Device: {CFG['device']}", flush=True)
 
 # ── 데이터 로드 ───────────────────────────────────────────────
@@ -86,21 +88,7 @@ def expand_cpc(code):
 # ── 토크나이저 ────────────────────────────────────────────────
 tokenizer = DebertaV2Tokenizer.from_pretrained(CFG["model_name"])
 
-def tokenize(anchor, target, context, max_len):
-    cpc_desc = expand_cpc(context)
-    text_a = cpc_desc + " " + anchor   # "human necessities obstacle course"
-    text_b = target                     # "obstacle position trajectory"
-    enc = tokenizer(
-        text_a,
-        text_b,
-        max_length=max_len,
-        padding="max_length",
-        truncation=True,
-        return_tensors="pt",
-    )
-    return {k: v.squeeze(0) for k, v in enc.items()}
-
-# ── Dataset ───────────────────────────────────────────────────
+# ── Dataset (pre-tokenize) ────────────────────────────────────
 class PatentDataset(Dataset):
     def __init__(self, df, is_test=False, augment=False):
         self.is_test = is_test
@@ -108,25 +96,43 @@ class PatentDataset(Dataset):
             swapped = df.copy()
             swapped["anchor"] = df["target"].values
             swapped["target"] = df["anchor"].values
-            self.df = pd.concat([df, swapped], ignore_index=True)
+            df = pd.concat([df, swapped], ignore_index=True)
         else:
-            self.df = df.reset_index(drop=True)
+            df = df.reset_index(drop=True)
+
+        texts_a = (df["context"].map(expand_cpc) + " " + df["anchor"]).tolist()
+        texts_b = df["target"].tolist()
+        print(f"  토큰화 중... ({len(texts_a)}개)", flush=True)
+        enc = tokenizer(
+            texts_a, texts_b,
+            max_length=CFG["max_length"],
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+        self.input_ids      = enc["input_ids"]
+        self.attention_mask = enc["attention_mask"]
+        self.token_type_ids = enc.get("token_type_ids")
+        if not is_test:
+            self.labels = torch.tensor(df["score"].values, dtype=torch.float)
 
     def __len__(self):
-        return len(self.df)
+        return len(self.input_ids)
 
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        enc = tokenize(row["anchor"], row["target"], row["context"], CFG["max_length"])
+        item = {"input_ids": self.input_ids[idx], "attention_mask": self.attention_mask[idx]}
+        if self.token_type_ids is not None:
+            item["token_type_ids"] = self.token_type_ids[idx]
         if self.is_test:
-            return enc
-        return enc, torch.tensor(row["score"], dtype=torch.float)
+            return item
+        return item, self.labels[idx]
 
 # ── 모델 ──────────────────────────────────────────────────────
 class PatentModel(nn.Module):
     def __init__(self, model_name):
         super().__init__()
         self.backbone   = AutoModel.from_pretrained(model_name)
+        self.backbone.gradient_checkpointing_enable()
         hidden          = self.backbone.config.hidden_size
         self.dropout    = nn.Dropout(0.1)
         self.regressor  = nn.Linear(hidden, 1)
@@ -212,7 +218,7 @@ oof_preds  = np.zeros(len(train))
 test_preds = np.zeros(len(test))
 
 test_ds     = PatentDataset(test, is_test=True)
-test_loader = DataLoader(test_ds, batch_size=CFG["batch_size"] * 2, shuffle=False, num_workers=2)
+test_loader = DataLoader(test_ds, batch_size=CFG["batch_size"] * 2, shuffle=False, num_workers=0, pin_memory=False)
 
 progress        = load_progress()
 completed_folds = progress.get("completed_folds", {})
@@ -248,8 +254,8 @@ for fold in CFG["train_folds"]:
 
     tr_ds      = PatentDataset(tr_df, augment=True)
     val_ds     = PatentDataset(val_df)
-    tr_loader  = DataLoader(tr_ds,  batch_size=CFG["batch_size"],     shuffle=True,  num_workers=2)
-    val_loader = DataLoader(val_ds, batch_size=CFG["batch_size"] * 2, shuffle=False, num_workers=2)
+    tr_loader  = DataLoader(tr_ds,  batch_size=CFG["batch_size"],     shuffle=True,  num_workers=0, pin_memory=False)
+    val_loader = DataLoader(val_ds, batch_size=CFG["batch_size"] * 2, shuffle=False, num_workers=0, pin_memory=False)
 
     model        = PatentModel(CFG["model_name"]).to(CFG["device"])
     optimizer    = torch.optim.AdamW(model.parameters(), lr=CFG["lr"], weight_decay=0.01)
@@ -317,6 +323,10 @@ for fold in CFG["train_folds"]:
         os.remove(epoch_ckpt_path)
     if os.path.exists(best_ckpt_path):
         os.remove(best_ckpt_path)
+
+    del model, optimizer, scheduler, scaler
+    gc.collect()
+    torch.cuda.empty_cache()
 
     print(f"\nFold {fold} 완료. Best pearson={best_pearson:.4f}", flush=True)
 
