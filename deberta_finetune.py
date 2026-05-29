@@ -257,13 +257,6 @@ def train_one_epoch(model, loader, optimizer, scheduler, scaler, ema, fgm,
         loss  = criterion(preds, labels) / CFG["grad_accum"]
         loss.backward()
 
-        # FGM: embedding에 adversarial noise 추가 후 한 번 더 backward
-        fgm.attack(CFG["fgm_eps"])
-        preds_adv = model(input_ids, attention_mask, token_type_ids)
-        loss_adv  = criterion(preds_adv, labels) / CFG["grad_accum"]
-        loss_adv.backward()
-        fgm.restore()
-
         if (step + 1) % CFG["grad_accum"] == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
