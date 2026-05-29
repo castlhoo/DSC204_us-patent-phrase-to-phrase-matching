@@ -58,6 +58,8 @@ def seed_everything(seed):
 
 seed_everything(CFG["seed"])
 torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 print(f"Device: {CFG['device']}", flush=True)
 
@@ -230,16 +232,13 @@ def train_one_epoch(model, loader, optimizer, scheduler, scaler, ema,
             token_type_ids = token_type_ids.to(CFG["device"])
         labels = labels.to(CFG["device"])
 
-        with torch.cuda.amp.autocast():
-            preds = model(input_ids, attention_mask, token_type_ids)
-            loss  = criterion(preds, labels) / CFG["grad_accum"]
-        scaler.scale(loss).backward()
+        preds = model(input_ids, attention_mask, token_type_ids)
+        loss  = criterion(preds, labels) / CFG["grad_accum"]
+        loss.backward()
 
         if (step + 1) % CFG["grad_accum"] == 0:
-            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
             ema.update()
@@ -276,9 +275,8 @@ def predict(model, loader, ema=None):
         token_type_ids = batch.get("token_type_ids")
         if token_type_ids is not None:
             token_type_ids = token_type_ids.to(CFG["device"])
-        with torch.cuda.amp.autocast():
-            out = model(input_ids, attention_mask, token_type_ids)
-        preds.append(out.cpu().numpy())
+        out = model(input_ids, attention_mask, token_type_ids)
+        preds.append(out.float().cpu().numpy())
     if ema is not None:
         ema.restore()
     return np.concatenate(preds)
