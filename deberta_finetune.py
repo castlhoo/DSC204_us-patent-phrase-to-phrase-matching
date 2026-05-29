@@ -275,7 +275,8 @@ def predict(model, loader, ema=None):
         token_type_ids = batch.get("token_type_ids")
         if token_type_ids is not None:
             token_type_ids = token_type_ids.to(CFG["device"])
-        out = model(input_ids, attention_mask, token_type_ids)
+        with torch.autocast('cuda', dtype=torch.bfloat16):
+            out = model(input_ids, attention_mask, token_type_ids)
         preds.append(out.cpu().numpy())
     if ema is not None:
         ema.restore()
@@ -343,7 +344,7 @@ for fold in CFG["train_folds"]:
     val_loader = DataLoader(val_ds, batch_size=CFG["batch_size"] * 2, shuffle=False,
                             num_workers=0, pin_memory=False)
 
-    model     = PatentModel(CFG["model_name"]).to(CFG["device"])
+    model     = PatentModel(CFG["model_name"]).to(CFG["device"]).bfloat16()
     optimizer = torch.optim.AdamW([
         {'params': model.backbone.parameters(),  'lr': CFG['lr']},
         {'params': list(model.lstm.parameters()) + list(model.regressor.parameters()),
