@@ -216,13 +216,6 @@ class AWP:
                 param.data = self.backup[name]
         self.backup = {}
 
-# ── Pearson Loss ──────────────────────────────────────────────
-class PearsonLoss(nn.Module):
-    def forward(self, pred, target):
-        x = pred - pred.mean()
-        y = target - target.mean()
-        cos = nn.CosineSimilarity(dim=0)
-        return 1 - cos(x, y)
 
 # ── 모델 (BiLSTM + Attention Pooling) ────────────────────────
 class PatentModel(nn.Module):
@@ -257,7 +250,7 @@ class PatentModel(nn.Module):
 def train_one_epoch(model, loader, optimizer, scheduler, ema, awp,
                     epoch, fold, best_pearson, start_step=0):
     model.train()
-    criterion      = PearsonLoss()
+    criterion      = nn.MSELoss()
     step_ckpt_path = f"{CFG['ckpt_dir']}/fold{fold}_step.pt"
 
     pre_iter_rng = {
