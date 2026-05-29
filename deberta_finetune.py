@@ -181,7 +181,7 @@ class EMA:
 class PatentModel(nn.Module):
     def __init__(self, model_name):
         super().__init__()
-        self.backbone = AutoModel.from_pretrained(model_name)
+        self.backbone = AutoModel.from_pretrained(model_name, torch_dtype=torch.float32)
         self.backbone.gradient_checkpointing_enable()
         hidden        = self.backbone.config.hidden_size   # 1024
         self.lstm     = nn.LSTM(hidden, 512, batch_first=True, bidirectional=True)
