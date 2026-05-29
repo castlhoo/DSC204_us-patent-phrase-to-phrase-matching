@@ -1,6 +1,12 @@
 """
-US Patent Phrase Similarity — DeBERTa-v3-large Fine-tuning v2
-개선: Target Groupby + EMA + BI-LSTM + FGM + Differential LR
+US Patent Phrase Similarity — DeBERTa-v3-large Fine-tuning v3
+1st place solution:
+  - lr=2e-5 (backbone), 1e-3 (head)  [critical: 2e-5 >> 3e-5]
+  - Pearson loss
+  - AWP from epoch 2
+  - BiLSTM + Attention Pooling (on top, not replacing)
+  - Linear scheduler
+  - Freeze embedding layer
 """
 
 import warnings
@@ -21,7 +27,7 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import (
     AutoModel,
     DebertaV2Tokenizer,
-    get_cosine_schedule_with_warmup,
+    get_linear_schedule_with_warmup,
 )
 from sklearn.model_selection import StratifiedKFold
 import scipy.stats as stats
@@ -33,8 +39,8 @@ CFG = {
     "batch_size"          : 32,
     "grad_accum"          : 8,
     "epochs"              : 5,
-    "lr"                  : 5e-5,
-    "head_lr"             : 2e-3,
+    "lr"                  : 2e-5,
+    "head_lr"             : 1e-3,
     "warmup_ratio"        : 0.1,
     "seed"                : 42,
     "n_folds"             : 5,
@@ -43,7 +49,8 @@ CFG = {
     "device"              : "cuda" if torch.cuda.is_available() else "cpu",
     "ckpt_dir"            : "checkpoints",
     "ema_decay"           : 0.999,
-    "fgm_eps"             : 0.1,
+    "awp_lr"              : 1e-4,
+    "awp_eps"             : 1e-2,
     "max_grouped_targets" : 5,
 }
 
@@ -104,7 +111,7 @@ def get_grouped_target(target, anchor, context, gmap):
     others = others[:CFG['max_grouped_targets']]
     return (target + '; ' + '; '.join(others)) if others else target
 
-# ── Dataset (pre-tokenize + groupby) ─────────────────────────
+# ── Dataset ───────────────────────────────────────────────────
 class PatentDataset(Dataset):
     def __init__(self, df, is_test=False, augment=False, gmap=None):
         self.is_test = is_test
@@ -180,7 +187,44 @@ class EMA:
                 param.data = self.backup[name]
         self.backup = {}
 
-# ── 모델 (BI-LSTM header) ─────────────────────────────────────
+# ── AWP (Adversarial Weight Perturbation) ─────────────────────
+class AWP:
+    def __init__(self, model, adv_lr=1e-4, adv_eps=1e-2):
+        self.model   = model
+        self.adv_lr  = adv_lr
+        self.adv_eps = adv_eps
+        self.backup  = {}
+
+    def attack(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and param.grad is not None:
+                self.backup[name] = param.data.clone()
+                norm1 = torch.norm(param.grad)
+                norm2 = torch.norm(param.data.detach())
+                if norm1 != 0 and not torch.isnan(norm1):
+                    r_at = self.adv_lr * param.grad / (norm1 + 1e-8) * (norm2 + 1e-8)
+                    param.data.add_(r_at)
+                    param.data = torch.clamp(
+                        param.data,
+                        self.backup[name] - self.adv_eps,
+                        self.backup[name] + self.adv_eps,
+                    )
+
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if name in self.backup:
+                param.data = self.backup[name]
+        self.backup = {}
+
+# ── Pearson Loss ──────────────────────────────────────────────
+class PearsonLoss(nn.Module):
+    def forward(self, pred, target):
+        x = pred - pred.mean()
+        y = target - target.mean()
+        cos = nn.CosineSimilarity(dim=0)
+        return 1 - cos(x, y)
+
+# ── 모델 (BiLSTM + Attention Pooling) ────────────────────────
 class PatentModel(nn.Module):
     def __init__(self, model_name):
         super().__init__()
@@ -188,6 +232,7 @@ class PatentModel(nn.Module):
         self.backbone  = self.backbone.float()
         hidden         = self.backbone.config.hidden_size  # 1024
         self.lstm      = nn.LSTM(hidden, 512, batch_first=True, bidirectional=True)
+        self.attention = nn.Linear(512 * 2, 1)             # attention over LSTM output
         self.dropout   = nn.Dropout(0.1)
         self.regressor = nn.Linear(512 * 2, 1)
 
@@ -195,39 +240,24 @@ class PatentModel(nn.Module):
         kwargs = dict(input_ids=input_ids, attention_mask=attention_mask)
         if token_type_ids is not None:
             kwargs["token_type_ids"] = token_type_ids
-        out     = self.backbone(**kwargs)
-        seq_out = out.last_hidden_state                    # (B, L, 1024)
-        lstm_out, _ = self.lstm(seq_out)                   # (B, L, 1024)
-        mask    = attention_mask.unsqueeze(-1).float()
-        pooled  = (lstm_out * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+        out      = self.backbone(**kwargs)
+        seq_out  = out.last_hidden_state                    # (B, L, 1024)
+        lstm_out, _ = self.lstm(seq_out)                    # (B, L, 1024)
+
+        # Attention pooling on LSTM output (1st place: linear attn on top of BiLSTM)
+        attn_w   = self.attention(lstm_out)                 # (B, L, 1)
+        mask     = attention_mask.unsqueeze(-1).float()
+        attn_w   = attn_w.masked_fill(mask == 0, -1e9)
+        attn_w   = torch.softmax(attn_w, dim=1)
+        pooled   = (lstm_out * attn_w).sum(1)               # (B, 1024)
 
         return torch.sigmoid(self.regressor(self.dropout(pooled))).squeeze(-1)
 
-# ── FGM (Fast Gradient Method) ────────────────────────────────
-class FGM:
-    def __init__(self, model):
-        self.model  = model
-        self.backup = {}
-
-    def attack(self, epsilon, emb_name='embeddings'):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and emb_name in name and param.grad is not None:
-                self.backup[name] = param.data.clone()
-                norm = torch.norm(param.grad)
-                if norm != 0:
-                    param.data.add_(epsilon * param.grad / norm)
-
-    def restore(self, emb_name='embeddings'):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and emb_name in name and name in self.backup:
-                param.data = self.backup[name]
-        self.backup = {}
-
-# ── 학습 함수 (EMA + FGM + 경량 step ckpt) ─────────────────────
-def train_one_epoch(model, loader, optimizer, scheduler, scaler, ema, fgm,
+# ── 학습 함수 ─────────────────────────────────────────────────
+def train_one_epoch(model, loader, optimizer, scheduler, ema, awp,
                     epoch, fold, best_pearson, start_step=0):
     model.train()
-    criterion      = nn.MSELoss()
+    criterion      = PearsonLoss()
     step_ckpt_path = f"{CFG['ckpt_dir']}/fold{fold}_step.pt"
 
     pre_iter_rng = {
@@ -258,6 +288,14 @@ def train_one_epoch(model, loader, optimizer, scheduler, scaler, ema, fgm,
         loss.backward()
 
         if (step + 1) % CFG["grad_accum"] == 0:
+            # AWP from epoch 2 (epoch index 1): perturb all weights
+            if epoch >= 1:
+                awp.attack()
+                preds_adv = model(input_ids, attention_mask, token_type_ids)
+                loss_adv  = criterion(preds_adv, labels) / CFG["grad_accum"]
+                loss_adv.backward()
+                awp.restore()
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
@@ -364,24 +402,29 @@ for fold in CFG["train_folds"]:
     val_loader = DataLoader(val_ds, batch_size=CFG["batch_size"] * 2, shuffle=False,
                             num_workers=0, pin_memory=False)
 
-    model     = PatentModel(CFG["model_name"]).to(CFG["device"])
+    model = PatentModel(CFG["model_name"]).to(CFG["device"])
+
+    # Freeze embedding layer (1st place: freeze not hurt, no need to finetune)
+    for param in model.backbone.embeddings.parameters():
+        param.requires_grad = False
+
     optimizer = torch.optim.AdamW([
         {'params': model.backbone.parameters(),  'lr': CFG['lr']},
-        {'params': list(model.lstm.parameters()) + list(model.regressor.parameters()),
+        {'params': (list(model.lstm.parameters()) +
+                    list(model.attention.parameters()) +
+                    list(model.regressor.parameters())),
          'lr': CFG['head_lr']},
     ], weight_decay=0.01)
     total_steps  = len(tr_loader) // CFG["grad_accum"] * CFG["epochs"]
     warmup_steps = int(total_steps * CFG["warmup_ratio"])
-    scheduler    = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-    scaler       = torch.cuda.amp.GradScaler()
+    scheduler    = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
     ema          = EMA(model, decay=CFG["ema_decay"])
-    fgm          = FGM(model)
+    awp          = AWP(model, adv_lr=CFG["awp_lr"], adv_eps=CFG["awp_eps"])
 
     start_epoch     = 0
     best_pearson    = -1.0
     epoch_ckpt_path = f"{CFG['ckpt_dir']}/fold{fold}_latest.pt"
     best_ckpt_path  = f"{CFG['ckpt_dir']}/fold{fold}_best.pt"
-
     step_ckpt_path  = f"{CFG['ckpt_dir']}/fold{fold}_step.pt"
     start_step      = 0
 
@@ -392,7 +435,7 @@ for fold in CFG["train_folds"]:
         start_step   = ckpt["step"]
         best_pearson = ckpt["best_pearson"]
         rng = ckpt["pre_iter_rng"]
-        torch.set_rng_state(rng['torch'])
+        torch.set_rng_state(rng['torch'].cpu() if hasattr(rng['torch'], 'cpu') else rng['torch'])
         np.random.set_state(rng['numpy'])
         random.setstate(rng['python'])
         fast_steps = start_epoch * (len(tr_loader) // CFG["grad_accum"])
@@ -413,7 +456,7 @@ for fold in CFG["train_folds"]:
         print(f"\n[Fold {fold} | Epoch {epoch+1}/{CFG['epochs']}]", flush=True)
         ep_start_step = start_step if epoch == start_epoch else 0
         train_loss = train_one_epoch(
-            model, tr_loader, optimizer, scheduler, scaler, ema, fgm,
+            model, tr_loader, optimizer, scheduler, ema, awp,
             epoch=epoch, fold=fold, best_pearson=best_pearson,
             start_step=ep_start_step,
         )
@@ -455,7 +498,7 @@ for fold in CFG["train_folds"]:
         if os.path.exists(p):
             os.remove(p)
 
-    del model, optimizer, scheduler, scaler, ema, fgm, tr_ds, val_ds
+    del model, optimizer, scheduler, ema, awp, tr_ds, val_ds
     gc.collect()
     torch.cuda.empty_cache()
 
