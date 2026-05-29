@@ -187,6 +187,7 @@ class PatentModel(nn.Module):
     def __init__(self, model_name):
         super().__init__()
         self.backbone = AutoModel.from_pretrained(model_name)
+        self.backbone = self.backbone.float()
         self.backbone.gradient_checkpointing_enable()
         hidden        = self.backbone.config.hidden_size   # 1024
         self.lstm     = nn.LSTM(hidden, 512, batch_first=True, bidirectional=True)
@@ -358,7 +359,7 @@ for fold in CFG["train_folds"]:
     total_steps  = len(tr_loader) // CFG["grad_accum"] * CFG["epochs"]
     warmup_steps = int(total_steps * CFG["warmup_ratio"])
     scheduler    = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-    scaler       = FP16GradScaler()
+    scaler       = torch.cuda.amp.GradScaler()
     ema          = EMA(model, decay=CFG["ema_decay"])
 
     start_epoch     = 0
