@@ -29,12 +29,12 @@ import scipy.stats as stats
 # ── 설정 ──────────────────────────────────────────────────────
 CFG = {
     "model_name"          : "microsoft/deberta-v3-large",
-    "max_length"          : 128,
+    "max_length"          : 192,
     "batch_size"          : 4,
     "grad_accum"          : 8,
-    "epochs"              : 3,
-    "lr"                  : 2e-5,
-    "head_lr"             : 1e-3,
+    "epochs"              : 5,
+    "lr"                  : 5e-5,
+    "head_lr"             : 2e-3,
     "warmup_ratio"        : 0.1,
     "seed"                : 42,
     "n_folds"             : 5,
@@ -180,30 +180,55 @@ class EMA:
                 param.data = self.backup[name]
         self.backup = {}
 
-# ── 모델 (BI-LSTM header) ─────────────────────────────────────
+# ── 모델 (Attention Pooling header) ──────────────────────────
 class PatentModel(nn.Module):
     def __init__(self, model_name):
         super().__init__()
-        self.backbone = AutoModel.from_pretrained(model_name)
-        self.backbone = self.backbone.float()
-        hidden        = self.backbone.config.hidden_size   # 1024
-        self.lstm     = nn.LSTM(hidden, 512, batch_first=True, bidirectional=True)
-        self.dropout  = nn.Dropout(0.1)
-        self.regressor = nn.Linear(512 * 2, 1)
+        self.backbone  = AutoModel.from_pretrained(model_name)
+        self.backbone  = self.backbone.float()
+        hidden         = self.backbone.config.hidden_size  # 1024
+        self.attention = nn.Linear(hidden, 1)
+        self.dropout   = nn.Dropout(0.1)
+        self.regressor = nn.Linear(hidden, 1)
 
     def forward(self, input_ids, attention_mask, token_type_ids=None):
         kwargs = dict(input_ids=input_ids, attention_mask=attention_mask)
         if token_type_ids is not None:
             kwargs["token_type_ids"] = token_type_ids
-        out      = self.backbone(**kwargs)
-        seq_out  = out.last_hidden_state                   # (B, L, 1024)
-        lstm_out, _ = self.lstm(seq_out)                   # (B, L, 1024)
-        mask     = attention_mask.unsqueeze(-1).float()
-        pooled   = (lstm_out * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+        out     = self.backbone(**kwargs)
+        seq_out = out.last_hidden_state                    # (B, L, 1024)
+
+        # Attention pooling: 각 토큰의 중요도를 학습해서 가중합산
+        attn_w  = self.attention(seq_out)                  # (B, L, 1)
+        mask    = attention_mask.unsqueeze(-1).float()
+        attn_w  = attn_w.masked_fill(mask == 0, -1e9)
+        attn_w  = torch.softmax(attn_w, dim=1)
+        pooled  = (seq_out * attn_w).sum(1)                # (B, 1024)
+
         return torch.sigmoid(self.regressor(self.dropout(pooled))).squeeze(-1)
 
-# ── 학습 함수 (EMA + 경량 step ckpt) ───────────────────────────
-def train_one_epoch(model, loader, optimizer, scheduler, scaler, ema,
+# ── FGM (Fast Gradient Method) ────────────────────────────────
+class FGM:
+    def __init__(self, model):
+        self.model  = model
+        self.backup = {}
+
+    def attack(self, epsilon, emb_name='embeddings'):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and emb_name in name and param.grad is not None:
+                self.backup[name] = param.data.clone()
+                norm = torch.norm(param.grad)
+                if norm != 0:
+                    param.data.add_(epsilon * param.grad / norm)
+
+    def restore(self, emb_name='embeddings'):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and emb_name in name and name in self.backup:
+                param.data = self.backup[name]
+        self.backup = {}
+
+# ── 학습 함수 (EMA + FGM + 경량 step ckpt) ─────────────────────
+def train_one_epoch(model, loader, optimizer, scheduler, scaler, ema, fgm,
                     epoch, fold, best_pearson, start_step=0):
     model.train()
     criterion      = nn.MSELoss()
@@ -235,6 +260,13 @@ def train_one_epoch(model, loader, optimizer, scheduler, scaler, ema,
         preds = model(input_ids, attention_mask, token_type_ids)
         loss  = criterion(preds, labels) / CFG["grad_accum"]
         loss.backward()
+
+        # FGM: embedding에 adversarial noise 추가 후 한 번 더 backward
+        fgm.attack(CFG["fgm_eps"])
+        preds_adv = model(input_ids, attention_mask, token_type_ids)
+        loss_adv  = criterion(preds_adv, labels) / CFG["grad_accum"]
+        loss_adv.backward()
+        fgm.restore()
 
         if (step + 1) % CFG["grad_accum"] == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -346,7 +378,7 @@ for fold in CFG["train_folds"]:
     model     = PatentModel(CFG["model_name"]).to(CFG["device"])
     optimizer = torch.optim.AdamW([
         {'params': model.backbone.parameters(),  'lr': CFG['lr']},
-        {'params': list(model.lstm.parameters()) + list(model.regressor.parameters()),
+        {'params': list(model.attention.parameters()) + list(model.regressor.parameters()),
          'lr': CFG['head_lr']},
     ], weight_decay=0.01)
     total_steps  = len(tr_loader) // CFG["grad_accum"] * CFG["epochs"]
@@ -354,6 +386,7 @@ for fold in CFG["train_folds"]:
     scheduler    = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
     scaler       = torch.cuda.amp.GradScaler()
     ema          = EMA(model, decay=CFG["ema_decay"])
+    fgm          = FGM(model)
 
     start_epoch     = 0
     best_pearson    = -1.0
@@ -380,7 +413,6 @@ for fold in CFG["train_folds"]:
     elif os.path.exists(epoch_ckpt_path):
         ckpt = torch.load(epoch_ckpt_path, map_location=CFG["device"], weights_only=False)
         model.load_state_dict(ckpt["model"])
-        ema.shadow   = ckpt.get("ema_shadow", {})
         start_epoch  = ckpt["epoch"] + 1
         best_pearson = ckpt["best_pearson"]
         fast_steps = start_epoch * (len(tr_loader) // CFG["grad_accum"])
@@ -392,7 +424,7 @@ for fold in CFG["train_folds"]:
         print(f"\n[Fold {fold} | Epoch {epoch+1}/{CFG['epochs']}]", flush=True)
         ep_start_step = start_step if epoch == start_epoch else 0
         train_loss = train_one_epoch(
-            model, tr_loader, optimizer, scheduler, scaler, ema,
+            model, tr_loader, optimizer, scheduler, scaler, ema, fgm,
             epoch=epoch, fold=fold, best_pearson=best_pearson,
             start_step=ep_start_step,
         )
@@ -412,7 +444,6 @@ for fold in CFG["train_folds"]:
         torch.save({
             "epoch"       : epoch,
             "model"       : model.state_dict(),
-            "ema_shadow"  : ema.shadow,
             "best_pearson": best_pearson,
         }, epoch_ckpt_path)
 
@@ -435,7 +466,7 @@ for fold in CFG["train_folds"]:
         if os.path.exists(p):
             os.remove(p)
 
-    del model, optimizer, scheduler, scaler, ema, tr_ds, val_ds
+    del model, optimizer, scheduler, scaler, ema, fgm, tr_ds, val_ds
     gc.collect()
     torch.cuda.empty_cache()
 
