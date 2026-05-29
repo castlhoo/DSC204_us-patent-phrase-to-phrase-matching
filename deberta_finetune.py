@@ -181,7 +181,7 @@ class EMA:
 class PatentModel(nn.Module):
     def __init__(self, model_name):
         super().__init__()
-        self.backbone = AutoModel.from_pretrained(model_name, torch_dtype=torch.float32)
+        self.backbone = AutoModel.from_pretrained(model_name, dtype=torch.float32)
         self.backbone.gradient_checkpointing_enable()
         hidden        = self.backbone.config.hidden_size   # 1024
         self.lstm     = nn.LSTM(hidden, 512, batch_first=True, bidirectional=True)
@@ -364,7 +364,7 @@ for fold in CFG["train_folds"]:
     start_step      = 0
 
     if os.path.exists(step_ckpt_path):
-        ckpt = torch.load(step_ckpt_path, map_location=CFG["device"])
+        ckpt = torch.load(step_ckpt_path, map_location=CFG["device"], weights_only=False)
         model.load_state_dict(ckpt["model"])
         start_epoch  = ckpt["epoch"]
         start_step   = ckpt["step"]
@@ -378,7 +378,7 @@ for fold in CFG["train_folds"]:
             scheduler.step()
         print(f"  Step ckpt: Epoch {start_epoch+1} Step {start_step}부터 재시작", flush=True)
     elif os.path.exists(epoch_ckpt_path):
-        ckpt = torch.load(epoch_ckpt_path, map_location=CFG["device"])
+        ckpt = torch.load(epoch_ckpt_path, map_location=CFG["device"], weights_only=False)
         model.load_state_dict(ckpt["model"])
         ema.shadow   = ckpt.get("ema_shadow", {})
         start_epoch  = ckpt["epoch"] + 1
@@ -416,7 +416,7 @@ for fold in CFG["train_folds"]:
             "best_pearson": best_pearson,
         }, epoch_ckpt_path)
 
-    model.load_state_dict(torch.load(best_ckpt_path, map_location=CFG["device"]))
+    model.load_state_dict(torch.load(best_ckpt_path, map_location=CFG["device"], weights_only=False))
     fold_oof  = predict(model, val_loader)
     fold_test = predict(model, test_loader)
 
