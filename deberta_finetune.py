@@ -431,10 +431,9 @@ for fold in CFG["train_folds"]:
     progress["completed_folds"] = completed_folds
     save_progress(progress)
 
-    if os.path.exists(epoch_ckpt_path):
-        os.remove(epoch_ckpt_path)
-    if os.path.exists(best_ckpt_path):
-        os.remove(best_ckpt_path)
+    for p in [epoch_ckpt_path, step_ckpt_path, best_ckpt_path]:
+        if os.path.exists(p):
+            os.remove(p)
 
     del model, optimizer, scheduler, scaler, ema, tr_ds, val_ds
     gc.collect()
