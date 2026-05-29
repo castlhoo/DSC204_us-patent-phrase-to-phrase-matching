@@ -32,7 +32,7 @@ CFG = {
     "max_length"          : 128,
     "batch_size"          : 4,
     "grad_accum"          : 8,
-    "epochs"              : 4,
+    "epochs"              : 3,
     "lr"                  : 2e-5,
     "head_lr"             : 1e-3,
     "warmup_ratio"        : 0.1,
@@ -341,7 +341,7 @@ for fold in CFG["train_folds"]:
     val_df  = train.iloc[val_idx]
     tr_gmap = build_group_map(tr_df)
 
-    tr_ds      = PatentDataset(tr_df,  augment=False, gmap=tr_gmap)
+    tr_ds      = PatentDataset(tr_df,  augment=True, gmap=tr_gmap)
     val_ds     = PatentDataset(val_df, gmap=tr_gmap)
     tr_loader  = DataLoader(tr_ds,  batch_size=CFG["batch_size"],     shuffle=True,
                             num_workers=0, pin_memory=False)
