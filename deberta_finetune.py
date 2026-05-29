@@ -234,7 +234,7 @@ def train_one_epoch(model, loader, optimizer, scheduler, scaler, ema,
             token_type_ids = token_type_ids.to(CFG["device"])
         labels = labels.to(CFG["device"])
 
-        with torch.autocast('cuda', dtype=torch.bfloat16):
+        with torch.cuda.amp.autocast():
             preds = model(input_ids, attention_mask, token_type_ids)
             loss  = criterion(preds, labels) / CFG["grad_accum"]
         scaler.scale(loss).backward()
