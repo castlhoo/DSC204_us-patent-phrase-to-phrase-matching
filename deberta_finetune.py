@@ -59,10 +59,6 @@ def seed_everything(seed):
 seed_everything(CFG["seed"])
 torch.backends.cudnn.benchmark = True
 
-class FP16GradScaler(torch.cuda.amp.GradScaler):
-    """Allow FP16 model training - bypasses PyTorch 2.6+ check."""
-    def _unscale_grads_(self, optimizer, inv_scale, found_inf, allow_fp16=False):
-        return super()._unscale_grads_(optimizer, inv_scale, found_inf, allow_fp16=True)
 print(f"Device: {CFG['device']}", flush=True)
 
 # ── 데이터 로드 ───────────────────────────────────────────────
@@ -188,7 +184,6 @@ class PatentModel(nn.Module):
         super().__init__()
         self.backbone = AutoModel.from_pretrained(model_name)
         self.backbone = self.backbone.float()
-        self.backbone.gradient_checkpointing_enable()
         hidden        = self.backbone.config.hidden_size   # 1024
         self.lstm     = nn.LSTM(hidden, 512, batch_first=True, bidirectional=True)
         self.dropout  = nn.Dropout(0.1)
