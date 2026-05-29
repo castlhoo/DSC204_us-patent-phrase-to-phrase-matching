@@ -199,9 +199,9 @@ class PatentModel(nn.Module):
         pooled   = (lstm_out * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
         return torch.sigmoid(self.regressor(self.dropout(pooled))).squeeze(-1)
 
-# ── 학습 함수 (EMA + step checkpoint) ───────────────────────
+# ── 학습 함수 (EMA + 경량 step ckpt) ───────────────────────────
 def train_one_epoch(model, loader, optimizer, scheduler, scaler, ema,
-                    epoch, fold, best_pearson, start_step=0, init_loss_sum=0.0):
+                    epoch, fold, best_pearson, start_step=0):
     model.train()
     criterion      = nn.MSELoss()
     step_ckpt_path = f"{CFG['ckpt_dir']}/fold{fold}_step.pt"
@@ -218,7 +218,7 @@ def train_one_epoch(model, loader, optimizer, scheduler, scaler, ema,
         for _ in range(start_step):
             next(loader_iter)
 
-    total_loss = init_loss_sum
+    total_loss = 0
     optimizer.zero_grad()
 
     for step, (batch, labels) in enumerate(loader_iter, start=start_step):
@@ -244,27 +244,22 @@ def train_one_epoch(model, loader, optimizer, scheduler, scaler, ema,
             ema.update()
 
         total_loss += loss.item() * CFG["grad_accum"]
-        if step % 1000 == 0:
-            print(f"  step {step}/{len(loader)}  loss={total_loss/(step+1):.4f}", flush=True)
+        if step % 100 == 0:
+            print(f"  step {step}/{len(loader)}  loss={total_loss/(step-start_step+1):.4f}", flush=True)
 
         if (step + 1) % 2000 == 0:
             torch.save({
-                "epoch"         : epoch,
-                "step"          : step + 1,
-                "model"         : model.state_dict(),
-                "optimizer"     : optimizer.state_dict(),
-                "scheduler"     : scheduler.state_dict(),
-                "scaler"        : scaler.state_dict(),
-                "ema_shadow"    : ema.shadow,
-                "best_pearson"  : best_pearson,
-                "total_loss_sum": total_loss,
-                "pre_iter_rng"  : pre_iter_rng,
+                "epoch"        : epoch,
+                "step"         : step + 1,
+                "model"        : model.state_dict(),
+                "best_pearson" : best_pearson,
+                "pre_iter_rng" : pre_iter_rng,
             }, step_ckpt_path)
 
     if os.path.exists(step_ckpt_path):
         os.remove(step_ckpt_path)
 
-    return total_loss / len(loader)
+    return total_loss / max(len(loader) - start_step, 1)
 
 @torch.no_grad()
 def predict(model, loader, ema=None):
@@ -361,48 +356,45 @@ for fold in CFG["train_folds"]:
     ema          = EMA(model, decay=CFG["ema_decay"])
 
     start_epoch     = 0
-    start_step      = 0
-    init_loss_sum   = 0.0
     best_pearson    = -1.0
     epoch_ckpt_path = f"{CFG['ckpt_dir']}/fold{fold}_latest.pt"
     best_ckpt_path  = f"{CFG['ckpt_dir']}/fold{fold}_best.pt"
+
     step_ckpt_path  = f"{CFG['ckpt_dir']}/fold{fold}_step.pt"
+    start_step      = 0
 
     if os.path.exists(step_ckpt_path):
         ckpt = torch.load(step_ckpt_path, map_location=CFG["device"])
         model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        scheduler.load_state_dict(ckpt["scheduler"])
-        scaler.load_state_dict(ckpt["scaler"])
-        ema.shadow    = ckpt["ema_shadow"]
-        start_epoch   = ckpt["epoch"]
-        start_step    = ckpt["step"]
-        init_loss_sum = ckpt["total_loss_sum"]
-        best_pearson  = ckpt["best_pearson"]
+        start_epoch  = ckpt["epoch"]
+        start_step   = ckpt["step"]
+        best_pearson = ckpt["best_pearson"]
         rng = ckpt["pre_iter_rng"]
         torch.set_rng_state(rng['torch'])
         np.random.set_state(rng['numpy'])
         random.setstate(rng['python'])
+        fast_steps = start_epoch * (len(tr_loader) // CFG["grad_accum"])
+        for _ in range(fast_steps):
+            scheduler.step()
         print(f"  Step ckpt: Epoch {start_epoch+1} Step {start_step}부터 재시작", flush=True)
     elif os.path.exists(epoch_ckpt_path):
         ckpt = torch.load(epoch_ckpt_path, map_location=CFG["device"])
         model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        scheduler.load_state_dict(ckpt["scheduler"])
-        scaler.load_state_dict(ckpt["scaler"])
-        ema.shadow   = ckpt["ema_shadow"]
+        ema.shadow   = ckpt.get("ema_shadow", {})
         start_epoch  = ckpt["epoch"] + 1
         best_pearson = ckpt["best_pearson"]
+        fast_steps = start_epoch * (len(tr_loader) // CFG["grad_accum"])
+        for _ in range(fast_steps):
+            scheduler.step()
         print(f"  Epoch ckpt: Epoch {start_epoch+1}부터 재시작 (best={best_pearson:.4f})", flush=True)
 
     for epoch in range(start_epoch, CFG["epochs"]):
         print(f"\n[Fold {fold} | Epoch {epoch+1}/{CFG['epochs']}]", flush=True)
         ep_start_step = start_step if epoch == start_epoch else 0
-        ep_init_loss  = init_loss_sum if epoch == start_epoch else 0.0
         train_loss = train_one_epoch(
             model, tr_loader, optimizer, scheduler, scaler, ema,
             epoch=epoch, fold=fold, best_pearson=best_pearson,
-            start_step=ep_start_step, init_loss_sum=ep_init_loss,
+            start_step=ep_start_step,
         )
 
         val_preds  = predict(model, val_loader, ema=ema)
@@ -420,9 +412,6 @@ for fold in CFG["train_folds"]:
         torch.save({
             "epoch"       : epoch,
             "model"       : model.state_dict(),
-            "optimizer"   : optimizer.state_dict(),
-            "scheduler"   : scheduler.state_dict(),
-            "scaler"      : scaler.state_dict(),
             "ema_shadow"  : ema.shadow,
             "best_pearson": best_pearson,
         }, epoch_ckpt_path)
