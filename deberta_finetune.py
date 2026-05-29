@@ -201,7 +201,7 @@ class PatentModel(nn.Module):
 
 # ── 학습 함수 (EMA + 경량 step ckpt) ───────────────────────────
 def train_one_epoch(model, loader, optimizer, scheduler, scaler, ema,
-                    epoch, fold, best_pearson, amp_dtype, start_step=0):
+                    epoch, fold, best_pearson, start_step=0):
     model.train()
     criterion      = nn.MSELoss()
     step_ckpt_path = f"{CFG['ckpt_dir']}/fold{fold}_step.pt"
@@ -229,7 +229,7 @@ def train_one_epoch(model, loader, optimizer, scheduler, scaler, ema,
             token_type_ids = token_type_ids.to(CFG["device"])
         labels = labels.to(CFG["device"])
 
-        with torch.autocast('cuda', dtype=amp_dtype):
+        with torch.cuda.amp.autocast():
             preds = model(input_ids, attention_mask, token_type_ids)
             loss  = criterion(preds, labels) / CFG["grad_accum"]
         scaler.scale(loss).backward()
@@ -352,8 +352,7 @@ for fold in CFG["train_folds"]:
     total_steps  = len(tr_loader) // CFG["grad_accum"] * CFG["epochs"]
     warmup_steps = int(total_steps * CFG["warmup_ratio"])
     scheduler    = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-    amp_dtype     = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    scaler       = torch.cuda.amp.GradScaler(enabled=False)
+    scaler       = torch.cuda.amp.GradScaler()
     ema          = EMA(model, decay=CFG["ema_decay"])
 
     start_epoch     = 0
@@ -395,7 +394,7 @@ for fold in CFG["train_folds"]:
         train_loss = train_one_epoch(
             model, tr_loader, optimizer, scheduler, scaler, ema,
             epoch=epoch, fold=fold, best_pearson=best_pearson,
-            amp_dtype=amp_dtype, start_step=ep_start_step,
+            start_step=ep_start_step,
         )
 
         val_preds  = predict(model, val_loader, ema=ema)
