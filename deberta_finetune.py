@@ -177,27 +177,6 @@ class EMA:
                 param.data = self.backup[name]
         self.backup = {}
 
-# ── FGM ───────────────────────────────────────────────────────
-class FGM:
-    def __init__(self, model, eps=0.1):
-        self.model  = model
-        self.eps    = eps
-        self.backup = {}
-
-    def attack(self, emb_name='embeddings'):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and emb_name in name and param.grad is not None:
-                self.backup[name] = param.data.clone()
-                norm = torch.norm(param.grad)
-                if norm != 0:
-                    param.data.add_(self.eps * param.grad / norm)
-
-    def restore(self, emb_name='embeddings'):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and emb_name in name and name in self.backup:
-                param.data = self.backup[name]
-        self.backup = {}
-
 # ── 모델 (BI-LSTM header) ─────────────────────────────────────
 class PatentModel(nn.Module):
     def __init__(self, model_name):
@@ -220,14 +199,29 @@ class PatentModel(nn.Module):
         pooled   = (lstm_out * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
         return torch.sigmoid(self.regressor(self.dropout(pooled))).squeeze(-1)
 
-# ── 학습 함수 (FGM + EMA) ─────────────────────────────────────
-def train_one_epoch(model, loader, optimizer, scheduler, scaler, fgm, ema):
+# ── 학습 함수 (EMA + step checkpoint) ───────────────────────
+def train_one_epoch(model, loader, optimizer, scheduler, scaler, ema,
+                    epoch, fold, best_pearson, start_step=0, init_loss_sum=0.0):
     model.train()
-    total_loss = 0
-    optimizer.zero_grad()
-    criterion  = nn.MSELoss()
+    criterion      = nn.MSELoss()
+    step_ckpt_path = f"{CFG['ckpt_dir']}/fold{fold}_step.pt"
 
-    for step, (batch, labels) in enumerate(loader):
+    pre_iter_rng = {
+        'torch': torch.get_rng_state(),
+        'numpy': np.random.get_state(),
+        'python': random.getstate(),
+    }
+
+    loader_iter = iter(loader)
+    if start_step > 0:
+        print(f"  {start_step} steps 건너뜀...", flush=True)
+        for _ in range(start_step):
+            next(loader_iter)
+
+    total_loss = init_loss_sum
+    optimizer.zero_grad()
+
+    for step, (batch, labels) in enumerate(loader_iter, start=start_step):
         input_ids      = batch["input_ids"].to(CFG["device"])
         attention_mask = batch["attention_mask"].to(CFG["device"])
         token_type_ids = batch.get("token_type_ids")
@@ -240,13 +234,6 @@ def train_one_epoch(model, loader, optimizer, scheduler, scaler, fgm, ema):
             loss  = criterion(preds, labels) / CFG["grad_accum"]
         scaler.scale(loss).backward()
 
-        fgm.attack()
-        with torch.cuda.amp.autocast():
-            preds_adv = model(input_ids, attention_mask, token_type_ids)
-            loss_adv  = criterion(preds_adv, labels) / CFG["grad_accum"]
-        scaler.scale(loss_adv).backward()
-        fgm.restore()
-
         if (step + 1) % CFG["grad_accum"] == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -257,8 +244,25 @@ def train_one_epoch(model, loader, optimizer, scheduler, scaler, fgm, ema):
             ema.update()
 
         total_loss += loss.item() * CFG["grad_accum"]
-        if step % 100 == 0:
+        if step % 1000 == 0:
             print(f"  step {step}/{len(loader)}  loss={total_loss/(step+1):.4f}", flush=True)
+
+        if (step + 1) % 2000 == 0:
+            torch.save({
+                "epoch"         : epoch,
+                "step"          : step + 1,
+                "model"         : model.state_dict(),
+                "optimizer"     : optimizer.state_dict(),
+                "scheduler"     : scheduler.state_dict(),
+                "scaler"        : scaler.state_dict(),
+                "ema_shadow"    : ema.shadow,
+                "best_pearson"  : best_pearson,
+                "total_loss_sum": total_loss,
+                "pre_iter_rng"  : pre_iter_rng,
+            }, step_ckpt_path)
+
+    if os.path.exists(step_ckpt_path):
+        os.remove(step_ckpt_path)
 
     return total_loss / len(loader)
 
@@ -337,7 +341,7 @@ for fold in CFG["train_folds"]:
     val_df  = train.iloc[val_idx]
     tr_gmap = build_group_map(tr_df)
 
-    tr_ds      = PatentDataset(tr_df,  augment=True, gmap=tr_gmap)
+    tr_ds      = PatentDataset(tr_df,  augment=False, gmap=tr_gmap)
     val_ds     = PatentDataset(val_df, gmap=tr_gmap)
     tr_loader  = DataLoader(tr_ds,  batch_size=CFG["batch_size"],     shuffle=True,
                             num_workers=0, pin_memory=False)
@@ -354,15 +358,33 @@ for fold in CFG["train_folds"]:
     warmup_steps = int(total_steps * CFG["warmup_ratio"])
     scheduler    = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
     scaler       = torch.cuda.amp.GradScaler()
-    fgm          = FGM(model, eps=CFG["fgm_eps"])
     ema          = EMA(model, decay=CFG["ema_decay"])
 
     start_epoch     = 0
+    start_step      = 0
+    init_loss_sum   = 0.0
     best_pearson    = -1.0
     epoch_ckpt_path = f"{CFG['ckpt_dir']}/fold{fold}_latest.pt"
     best_ckpt_path  = f"{CFG['ckpt_dir']}/fold{fold}_best.pt"
+    step_ckpt_path  = f"{CFG['ckpt_dir']}/fold{fold}_step.pt"
 
-    if os.path.exists(epoch_ckpt_path):
+    if os.path.exists(step_ckpt_path):
+        ckpt = torch.load(step_ckpt_path, map_location=CFG["device"])
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        scaler.load_state_dict(ckpt["scaler"])
+        ema.shadow    = ckpt["ema_shadow"]
+        start_epoch   = ckpt["epoch"]
+        start_step    = ckpt["step"]
+        init_loss_sum = ckpt["total_loss_sum"]
+        best_pearson  = ckpt["best_pearson"]
+        rng = ckpt["pre_iter_rng"]
+        torch.set_rng_state(rng['torch'])
+        np.random.set_state(rng['numpy'])
+        random.setstate(rng['python'])
+        print(f"  Step ckpt: Epoch {start_epoch+1} Step {start_step}부터 재시작", flush=True)
+    elif os.path.exists(epoch_ckpt_path):
         ckpt = torch.load(epoch_ckpt_path, map_location=CFG["device"])
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -371,11 +393,17 @@ for fold in CFG["train_folds"]:
         ema.shadow   = ckpt["ema_shadow"]
         start_epoch  = ckpt["epoch"] + 1
         best_pearson = ckpt["best_pearson"]
-        print(f"  Epoch {start_epoch+1}부터 재시작 (best={best_pearson:.4f})", flush=True)
+        print(f"  Epoch ckpt: Epoch {start_epoch+1}부터 재시작 (best={best_pearson:.4f})", flush=True)
 
     for epoch in range(start_epoch, CFG["epochs"]):
         print(f"\n[Fold {fold} | Epoch {epoch+1}/{CFG['epochs']}]", flush=True)
-        train_loss = train_one_epoch(model, tr_loader, optimizer, scheduler, scaler, fgm, ema)
+        ep_start_step = start_step if epoch == start_epoch else 0
+        ep_init_loss  = init_loss_sum if epoch == start_epoch else 0.0
+        train_loss = train_one_epoch(
+            model, tr_loader, optimizer, scheduler, scaler, ema,
+            epoch=epoch, fold=fold, best_pearson=best_pearson,
+            start_step=ep_start_step, init_loss_sum=ep_init_loss,
+        )
 
         val_preds  = predict(model, val_loader, ema=ema)
         val_labels = val_df["score"].values
@@ -419,7 +447,7 @@ for fold in CFG["train_folds"]:
     if os.path.exists(best_ckpt_path):
         os.remove(best_ckpt_path)
 
-    del model, optimizer, scheduler, scaler, fgm, ema, tr_ds, val_ds
+    del model, optimizer, scheduler, scaler, ema, tr_ds, val_ds
     gc.collect()
     torch.cuda.empty_cache()
 
