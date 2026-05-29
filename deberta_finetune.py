@@ -181,7 +181,8 @@ class EMA:
 class PatentModel(nn.Module):
     def __init__(self, model_name):
         super().__init__()
-        self.backbone = AutoModel.from_pretrained(model_name, dtype=torch.bfloat16)
+        self.backbone = AutoModel.from_pretrained(model_name)
+        self.backbone = self.backbone.float()
         self.backbone.gradient_checkpointing_enable()
         hidden        = self.backbone.config.hidden_size   # 1024
         self.lstm     = nn.LSTM(hidden, 512, batch_first=True, bidirectional=True)
@@ -275,7 +276,7 @@ def predict(model, loader, ema=None):
         token_type_ids = batch.get("token_type_ids")
         if token_type_ids is not None:
             token_type_ids = token_type_ids.to(CFG["device"])
-        with torch.autocast('cuda', dtype=torch.bfloat16):
+        with torch.cuda.amp.autocast():
             out = model(input_ids, attention_mask, token_type_ids)
         preds.append(out.cpu().numpy())
     if ema is not None:
@@ -344,7 +345,7 @@ for fold in CFG["train_folds"]:
     val_loader = DataLoader(val_ds, batch_size=CFG["batch_size"] * 2, shuffle=False,
                             num_workers=0, pin_memory=False)
 
-    model     = PatentModel(CFG["model_name"]).to(CFG["device"]).bfloat16()
+    model     = PatentModel(CFG["model_name"]).to(CFG["device"])
     optimizer = torch.optim.AdamW([
         {'params': model.backbone.parameters(),  'lr': CFG['lr']},
         {'params': list(model.lstm.parameters()) + list(model.regressor.parameters()),
@@ -353,7 +354,7 @@ for fold in CFG["train_folds"]:
     total_steps  = len(tr_loader) // CFG["grad_accum"] * CFG["epochs"]
     warmup_steps = int(total_steps * CFG["warmup_ratio"])
     scheduler    = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-    scaler       = torch.cuda.amp.GradScaler(enabled=False)
+    scaler       = torch.cuda.amp.GradScaler()
     ema          = EMA(model, decay=CFG["ema_decay"])
 
     start_epoch     = 0
