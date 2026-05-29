@@ -180,16 +180,16 @@ class EMA:
                 param.data = self.backup[name]
         self.backup = {}
 
-# ── 모델 (Attention Pooling header) ──────────────────────────
+# ── 모델 (BI-LSTM header) ─────────────────────────────────────
 class PatentModel(nn.Module):
     def __init__(self, model_name):
         super().__init__()
         self.backbone  = AutoModel.from_pretrained(model_name)
         self.backbone  = self.backbone.float()
         hidden         = self.backbone.config.hidden_size  # 1024
-        self.attention = nn.Linear(hidden, 1)
+        self.lstm      = nn.LSTM(hidden, 512, batch_first=True, bidirectional=True)
         self.dropout   = nn.Dropout(0.1)
-        self.regressor = nn.Linear(hidden, 1)
+        self.regressor = nn.Linear(512 * 2, 1)
 
     def forward(self, input_ids, attention_mask, token_type_ids=None):
         kwargs = dict(input_ids=input_ids, attention_mask=attention_mask)
@@ -197,13 +197,9 @@ class PatentModel(nn.Module):
             kwargs["token_type_ids"] = token_type_ids
         out     = self.backbone(**kwargs)
         seq_out = out.last_hidden_state                    # (B, L, 1024)
-
-        # Attention pooling: 각 토큰의 중요도를 학습해서 가중합산
-        attn_w  = self.attention(seq_out)                  # (B, L, 1)
+        lstm_out, _ = self.lstm(seq_out)                   # (B, L, 1024)
         mask    = attention_mask.unsqueeze(-1).float()
-        attn_w  = attn_w.masked_fill(mask == 0, -1e9)
-        attn_w  = torch.softmax(attn_w, dim=1)
-        pooled  = (seq_out * attn_w).sum(1)                # (B, 1024)
+        pooled  = (lstm_out * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
 
         return torch.sigmoid(self.regressor(self.dropout(pooled))).squeeze(-1)
 
@@ -378,7 +374,7 @@ for fold in CFG["train_folds"]:
     model     = PatentModel(CFG["model_name"]).to(CFG["device"])
     optimizer = torch.optim.AdamW([
         {'params': model.backbone.parameters(),  'lr': CFG['lr']},
-        {'params': list(model.attention.parameters()) + list(model.regressor.parameters()),
+        {'params': list(model.lstm.parameters()) + list(model.regressor.parameters()),
          'lr': CFG['head_lr']},
     ], weight_decay=0.01)
     total_steps  = len(tr_loader) // CFG["grad_accum"] * CFG["epochs"]
