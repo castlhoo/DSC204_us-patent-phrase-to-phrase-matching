@@ -58,6 +58,11 @@ def seed_everything(seed):
 
 seed_everything(CFG["seed"])
 torch.backends.cudnn.benchmark = True
+
+class FP16GradScaler(torch.cuda.amp.GradScaler):
+    """Allow FP16 model training - bypasses PyTorch 2.6+ check."""
+    def _unscale_grads_(self, optimizer, inv_scale, found_inf, allow_fp16=False):
+        return super()._unscale_grads_(optimizer, inv_scale, found_inf, allow_fp16=True)
 print(f"Device: {CFG['device']}", flush=True)
 
 # ── 데이터 로드 ───────────────────────────────────────────────
@@ -182,7 +187,6 @@ class PatentModel(nn.Module):
     def __init__(self, model_name):
         super().__init__()
         self.backbone = AutoModel.from_pretrained(model_name)
-        self.backbone = self.backbone.float()
         self.backbone.gradient_checkpointing_enable()
         hidden        = self.backbone.config.hidden_size   # 1024
         self.lstm     = nn.LSTM(hidden, 512, batch_first=True, bidirectional=True)
@@ -354,7 +358,7 @@ for fold in CFG["train_folds"]:
     total_steps  = len(tr_loader) // CFG["grad_accum"] * CFG["epochs"]
     warmup_steps = int(total_steps * CFG["warmup_ratio"])
     scheduler    = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-    scaler       = torch.cuda.amp.GradScaler()
+    scaler       = FP16GradScaler()
     ema          = EMA(model, decay=CFG["ema_decay"])
 
     start_epoch     = 0
