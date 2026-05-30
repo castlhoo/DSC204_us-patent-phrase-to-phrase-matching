@@ -42,7 +42,7 @@ CFG = {
     "data_path"           : "data/us-patent-phrase-to-phrase-matching.zip",
     "device"              : "cuda" if torch.cuda.is_available() else "cpu",
     "ckpt_dir"            : "checkpoints",
-    "ema_decay"           : 0.999,
+    "ema_decay"           : 0.99,
     "awp_lr"              : 1e-4,
     "awp_eps"             : 1e-2,
     "max_grouped_targets" : 5,
