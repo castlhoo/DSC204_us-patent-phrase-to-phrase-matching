@@ -1,6 +1,6 @@
 """
-US Patent Phrase Similarity — DeBERTa-v3-large Fine-tuning v2
-개선: Target Groupby + EMA + BI-LSTM + FGM + Differential LR
+US Patent Phrase Similarity — DeBERTa-v3-large Fine-tuning v3
+개선: Target Groupby + EMA + BI-LSTM + AWP + Differential LR
 """
 
 import warnings
@@ -29,10 +29,10 @@ import scipy.stats as stats
 # ── 설정 ──────────────────────────────────────────────────────
 CFG = {
     "model_name"          : "microsoft/deberta-v3-large",
-    "max_length"          : 128,
-    "batch_size"          : 4,
+    "max_length"          : 192,
+    "batch_size"          : 16,
     "grad_accum"          : 8,
-    "epochs"              : 3,
+    "epochs"              : 5,
     "lr"                  : 2e-5,
     "head_lr"             : 1e-3,
     "warmup_ratio"        : 0.1,
@@ -43,7 +43,8 @@ CFG = {
     "device"              : "cuda" if torch.cuda.is_available() else "cpu",
     "ckpt_dir"            : "checkpoints",
     "ema_decay"           : 0.999,
-    "fgm_eps"             : 0.1,
+    "awp_lr"              : 1e-4,
+    "awp_eps"             : 1e-2,
     "max_grouped_targets" : 5,
 }
 
@@ -180,6 +181,35 @@ class EMA:
                 param.data = self.backup[name]
         self.backup = {}
 
+# ── AWP (Adversarial Weight Perturbation) ────────────────────
+class AWP:
+    def __init__(self, model, adv_lr=1e-4, adv_eps=1e-2):
+        self.model   = model
+        self.adv_lr  = adv_lr
+        self.adv_eps = adv_eps
+        self.backup  = {}
+
+    def attack(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and param.grad is not None:
+                self.backup[name] = param.data.clone()
+                norm1 = torch.norm(param.grad)
+                norm2 = torch.norm(param.data)
+                if norm1 != 0 and not torch.isnan(norm1):
+                    r_at = self.adv_lr * param.grad / (norm1 + 1e-8) * (norm2 + 1e-8)
+                    param.data.add_(r_at)
+                    param.data = torch.clamp(
+                        param.data,
+                        self.backup[name] - self.adv_eps,
+                        self.backup[name] + self.adv_eps,
+                    )
+
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if name in self.backup:
+                param.data = self.backup[name]
+        self.backup = {}
+
 # ── 모델 (BI-LSTM header) ─────────────────────────────────────
 class PatentModel(nn.Module):
     def __init__(self, model_name):
@@ -202,8 +232,8 @@ class PatentModel(nn.Module):
         pooled   = (lstm_out * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
         return torch.sigmoid(self.regressor(self.dropout(pooled))).squeeze(-1)
 
-# ── 학습 함수 (EMA + 경량 step ckpt) ───────────────────────────
-def train_one_epoch(model, loader, optimizer, scheduler, scaler, ema,
+# ── 학습 함수 (EMA + AWP + 경량 step ckpt) ──────────────────────
+def train_one_epoch(model, loader, optimizer, scheduler, scaler, ema, awp,
                     epoch, fold, best_pearson, start_step=0):
     model.train()
     criterion      = nn.MSELoss()
@@ -237,6 +267,12 @@ def train_one_epoch(model, loader, optimizer, scheduler, scaler, ema,
         loss.backward()
 
         if (step + 1) % CFG["grad_accum"] == 0:
+            if epoch >= 1:  # AWP epoch 2부터
+                awp.attack()
+                preds_adv = model(input_ids, attention_mask, token_type_ids)
+                loss_adv  = criterion(preds_adv, labels) / CFG["grad_accum"]
+                loss_adv.backward()
+                awp.restore()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
@@ -354,6 +390,7 @@ for fold in CFG["train_folds"]:
     scheduler    = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
     scaler       = torch.cuda.amp.GradScaler()
     ema          = EMA(model, decay=CFG["ema_decay"])
+    awp          = AWP(model, adv_lr=CFG["awp_lr"], adv_eps=CFG["awp_eps"])
 
     start_epoch     = 0
     best_pearson    = -1.0
@@ -392,7 +429,7 @@ for fold in CFG["train_folds"]:
         print(f"\n[Fold {fold} | Epoch {epoch+1}/{CFG['epochs']}]", flush=True)
         ep_start_step = start_step if epoch == start_epoch else 0
         train_loss = train_one_epoch(
-            model, tr_loader, optimizer, scheduler, scaler, ema,
+            model, tr_loader, optimizer, scheduler, scaler, ema, awp,
             epoch=epoch, fold=fold, best_pearson=best_pearson,
             start_step=ep_start_step,
         )
@@ -435,7 +472,7 @@ for fold in CFG["train_folds"]:
         if os.path.exists(p):
             os.remove(p)
 
-    del model, optimizer, scheduler, scaler, ema, tr_ds, val_ds
+    del model, optimizer, scheduler, scaler, ema, awp, tr_ds, val_ds
     gc.collect()
     torch.cuda.empty_cache()
 
