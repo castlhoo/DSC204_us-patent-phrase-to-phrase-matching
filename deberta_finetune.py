@@ -30,7 +30,7 @@ import scipy.stats as stats
 CFG = {
     "model_name"          : "microsoft/deberta-v3-large",
     "max_length"          : 192,
-    "batch_size"          : 16,
+    "batch_size"          : 4,
     "grad_accum"          : 8,
     "epochs"              : 5,
     "lr"                  : 2e-5,
