@@ -59,8 +59,11 @@ def seed_everything(seed):
 
 seed_everything(CFG["seed"])
 torch.backends.cudnn.benchmark = True
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+# TF32 비활성화: A100에서 TF32(10bit mantissa)가 DeBERTa disentangled
+# attention 정밀도를 망가뜨려 collapse 유발. DSMLP(구형 GPU)는 TF32 미지원이라
+# 순수 FP32로 돌아서 수렴했음. Colab A100에서도 순수 FP32 강제.
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
 
 print(f"Device: {CFG['device']}", flush=True)
 
