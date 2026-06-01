@@ -1,6 +1,6 @@
 """
 US Patent Phrase Similarity — DeBERTa-v3-large Fine-tuning v3
-개선: Target Groupby + EMA + BI-LSTM + AWP + Differential LR
+개선: Target Groupby + EMA + AWP + Differential LR (CLS pooling)
 """
 
 import warnings
@@ -213,27 +213,23 @@ class AWP:
                 param.data = self.backup[name]
         self.backup = {}
 
-# ── 모델 (BI-LSTM header) ─────────────────────────────────────
+# ── 모델 (검증된 CLS pooling, 0.858 구조) ─────────────────────
 class PatentModel(nn.Module):
     def __init__(self, model_name):
         super().__init__()
-        self.backbone = AutoModel.from_pretrained(model_name)
-        self.backbone = self.backbone.float()
-        hidden        = self.backbone.config.hidden_size   # 1024
-        self.lstm     = nn.LSTM(hidden, 512, batch_first=True, bidirectional=True)
-        self.dropout  = nn.Dropout(0.1)
-        self.regressor = nn.Linear(512 * 2, 1)
+        self.backbone  = AutoModel.from_pretrained(model_name)
+        self.backbone  = self.backbone.float()
+        hidden         = self.backbone.config.hidden_size   # 1024
+        self.dropout   = nn.Dropout(0.1)
+        self.regressor = nn.Linear(hidden, 1)
 
     def forward(self, input_ids, attention_mask, token_type_ids=None):
         kwargs = dict(input_ids=input_ids, attention_mask=attention_mask)
         if token_type_ids is not None:
             kwargs["token_type_ids"] = token_type_ids
-        out      = self.backbone(**kwargs)
-        seq_out  = out.last_hidden_state                   # (B, L, 1024)
-        lstm_out, _ = self.lstm(seq_out)                   # (B, L, 1024)
-        mask     = attention_mask.unsqueeze(-1).float()
-        pooled   = (lstm_out * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
-        return torch.sigmoid(self.regressor(self.dropout(pooled))).squeeze(-1)
+        out = self.backbone(**kwargs)
+        cls = out.last_hidden_state[:, 0, :]               # CLS 토큰
+        return torch.sigmoid(self.regressor(self.dropout(cls))).squeeze(-1)
 
 # ── 학습 함수 (EMA + AWP + 경량 step ckpt) ──────────────────────
 def train_one_epoch(model, loader, optimizer, scheduler, scaler, ema, awp,
@@ -385,8 +381,7 @@ for fold in CFG["train_folds"]:
     model     = PatentModel(CFG["model_name"]).to(CFG["device"])
     optimizer = torch.optim.AdamW([
         {'params': model.backbone.parameters(),  'lr': CFG['lr']},
-        {'params': list(model.lstm.parameters()) + list(model.regressor.parameters()),
-         'lr': CFG['head_lr']},
+        {'params': model.regressor.parameters(), 'lr': CFG['head_lr']},
     ], weight_decay=0.01)
     total_steps  = len(tr_loader) // CFG["grad_accum"] * CFG["epochs"]
     warmup_steps = int(total_steps * CFG["warmup_ratio"])
