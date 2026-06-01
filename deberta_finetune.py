@@ -137,7 +137,8 @@ class PatentModel(nn.Module):
         super().__init__()
         self.backbone   = AutoModel.from_pretrained(model_name)
         self.backbone   = self.backbone.float()
-        self.backbone.gradient_checkpointing_enable()
+        # gradient_checkpointing 제거: PyTorch 2.6에서 use_reentrant 기본값이
+        # backbone gradient를 차단 -> collapse. A100 40GB면 불필요.
         hidden          = self.backbone.config.hidden_size
         self.dropout    = nn.Dropout(0.1)
         self.regressor  = nn.Linear(hidden, 1)
@@ -177,7 +178,12 @@ def train_one_epoch(model, loader, optimizer, scheduler, scaler):
 
         total_loss += loss.item() * CFG["grad_accum"]
         if step % 100 == 0:
-            print(f"  step {step}/{len(loader)}  loss={total_loss/(step+1):.4f}", flush=True)
+            bb_grad = 0.0
+            for p in model.backbone.parameters():
+                if p.grad is not None:
+                    bb_grad = p.grad.norm().item()
+                    break
+            print(f"  step {step}/{len(loader)}  loss={total_loss/(step+1):.4f}  bb_grad={bb_grad:.6f}", flush=True)
 
     return total_loss / len(loader)
 
