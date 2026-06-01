@@ -136,9 +136,7 @@ class PatentModel(nn.Module):
     def __init__(self, model_name):
         super().__init__()
         self.backbone   = AutoModel.from_pretrained(model_name)
-        self.backbone   = self.backbone.float()
-        # gradient_checkpointing 제거: PyTorch 2.6에서 use_reentrant 기본값이
-        # backbone gradient를 차단 -> collapse. A100 40GB면 불필요.
+        # gradient_checkpointing 제거: PyTorch 2.6 autocast 충돌 회피. A100이면 불필요.
         hidden          = self.backbone.config.hidden_size
         self.dropout    = nn.Dropout(0.1)
         self.regressor  = nn.Linear(hidden, 1)
@@ -166,13 +164,17 @@ def train_one_epoch(model, loader, optimizer, scheduler, scaler):
             token_type_ids = token_type_ids.to(CFG["device"])
         labels = labels.to(CFG["device"])
 
-        preds = model(input_ids, attention_mask, token_type_ids)
-        loss  = criterion(preds, labels) / CFG["grad_accum"]
-        loss.backward()
+        with torch.cuda.amp.autocast():
+            preds = model(input_ids, attention_mask, token_type_ids)
+            loss  = criterion(preds, labels) / CFG["grad_accum"]
+
+        scaler.scale(loss).backward()
 
         if (step + 1) % CFG["grad_accum"] == 0:
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
             optimizer.zero_grad()
 
