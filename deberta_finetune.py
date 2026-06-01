@@ -434,10 +434,14 @@ for fold in CFG["train_folds"]:
             start_step=ep_start_step,
         )
 
-        val_preds  = predict(model, val_loader, ema=ema)
-        val_labels = val_df["score"].values
-        pearson    = stats.pearsonr(val_labels, val_preds)[0]
-        print(f"  train_loss={train_loss:.4f}  val_pearson={pearson:.4f}", flush=True)
+        val_preds     = predict(model, val_loader, ema=ema)
+        val_preds_raw = predict(model, val_loader)            # EMA 미적용 (진단용)
+        val_labels    = val_df["score"].values
+        pearson       = stats.pearsonr(val_labels, val_preds)[0]
+        pearson_raw   = stats.pearsonr(val_labels, val_preds_raw)[0]
+        print(f"  train_loss={train_loss:.4f}", flush=True)
+        print(f"  [EMA] pearson={pearson:.4f}  pred_std={val_preds.std():.4f}", flush=True)
+        print(f"  [RAW] pearson={pearson_raw:.4f}  pred_std={val_preds_raw.std():.4f}", flush=True)
 
         if pearson > best_pearson:
             best_pearson = pearson
