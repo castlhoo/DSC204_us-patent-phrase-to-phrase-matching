@@ -135,7 +135,10 @@ class PatentDataset(Dataset):
 class PatentModel(nn.Module):
     def __init__(self, model_name):
         super().__init__()
-        self.backbone   = AutoModel.from_pretrained(model_name)
+        # torch_dtype=float32 명시: 최신 transformers가 deberta-v3를 FP16으로 로드해
+        # gradient가 죽는 문제(bb_grad=0) 방지. UCSD 구버전은 기본 float32였음.
+        self.backbone   = AutoModel.from_pretrained(model_name, torch_dtype=torch.float32)
+        self.backbone   = self.backbone.float()
         # gradient_checkpointing 제거: PyTorch 2.6 autocast 충돌 회피. A100이면 불필요.
         hidden          = self.backbone.config.hidden_size
         self.dropout    = nn.Dropout(0.1)
