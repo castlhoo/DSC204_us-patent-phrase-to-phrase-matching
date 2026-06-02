@@ -457,7 +457,13 @@ for fold in CFG["train_folds"]:
             "best_pearson": best_pearson,
         }, epoch_ckpt_path)
 
-    model.load_state_dict(torch.load(best_ckpt_path, map_location=CFG["device"], weights_only=False))
+    # best_ckpt가 있으면 로드, 없으면(끊김/정리로 유실) 현재 메모리 model 사용
+    if os.path.exists(best_ckpt_path):
+        model.load_state_dict(torch.load(best_ckpt_path, map_location=CFG["device"], weights_only=False))
+        print("Best 모델 로드", flush=True)
+    else:
+        print(f"⚠️ best_ckpt 없음 — 현재 메모리 model(EMA shadow 적용)로 예측", flush=True)
+        ema.apply_shadow()   # EMA 가중치로 예측 (val_pearson을 낸 그 가중치)
     fold_oof  = predict(model, val_loader)
     fold_test = predict(model, test_loader)
 
