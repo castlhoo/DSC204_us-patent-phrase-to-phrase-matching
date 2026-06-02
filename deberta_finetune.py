@@ -411,7 +411,7 @@ for fold in CFG["train_folds"]:
         start_step   = ckpt["step"]
         best_pearson = ckpt["best_pearson"]
         rng = ckpt["pre_iter_rng"]
-        torch.set_rng_state(rng['torch'])
+        torch.set_rng_state(rng['torch'].cpu().to(torch.uint8))  # CUDA->CPU ByteTensor
         np.random.set_state(rng['numpy'])
         random.setstate(rng['python'])
         fast_steps = start_epoch * (len(tr_loader) // CFG["grad_accum"])
