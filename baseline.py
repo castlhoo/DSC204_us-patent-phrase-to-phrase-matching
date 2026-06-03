@@ -15,7 +15,7 @@ sub   = pd.read_csv(io.BytesIO(z.read("sample_submission.csv")))
 
 print(f"Train: {train.shape}, Test: {test.shape}")
 
-# context 코드를 텍스트에 포함 (anchor와 target에 context 붙이기)
+# Prepend the context code to both anchor and target text
 def make_text(df):
     return (df["context"] + " " + df["anchor"]).tolist(), \
            (df["context"] + " " + df["target"]).tolist()
@@ -23,12 +23,12 @@ def make_text(df):
 tr_anchor, tr_target = make_text(train)
 te_anchor, te_target = make_text(test)
 
-# TF-IDF: anchor와 target 합쳐서 vocabulary 학습
+# TF-IDF: fit vocabulary on anchor + target combined
 all_texts = tr_anchor + tr_target + te_anchor + te_target
 tfidf = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4), max_features=50000)
 tfidf.fit(all_texts)
 
-# 코사인 유사도 계산
+# Compute cosine similarity
 def get_scores(anchors, targets):
     vec_a = tfidf.transform(anchors)
     vec_t = tfidf.transform(targets)
@@ -38,15 +38,15 @@ def get_scores(anchors, targets):
     ])
     return scores
 
-print("Train 유사도 계산 중...")
+print("Computing train similarity...")
 train_scores = get_scores(tr_anchor, tr_target)
 pearson = stats.pearsonr(train["score"].values, train_scores)[0]
 print(f"Train Pearson: {pearson:.4f}")
 
-print("Test 유사도 계산 중...")
+print("Computing test similarity...")
 test_scores = get_scores(te_anchor, te_target)
 
 sub["score"] = test_scores
 sub.to_csv("predictions.csv", index=False)
-print("predictions.csv 저장 완료!")
+print("predictions.csv saved!")
 print(sub.head())

@@ -1,6 +1,6 @@
 """
 US Patent Phrase Similarity — DeBERTa-v3-large Fine-tuning v2
-개선: Target Groupby + EMA + BI-LSTM + AWP(ep2~) + Differential LR + max_len 192
+Improvements: Target Groupby + EMA + BiLSTM + AWP(ep2+) + Differential LR + max_len 192
 """
 
 import warnings
@@ -26,7 +26,7 @@ from transformers import (
 from sklearn.model_selection import StratifiedKFold
 import scipy.stats as stats
 
-# ── 설정 ──────────────────────────────────────────────────────
+# ── Config ───────────────────────────────────────────────────
 CFG = {
     "model_name"          : "microsoft/deberta-v3-large",
     "max_length"          : 192,
@@ -45,7 +45,7 @@ CFG = {
     "ema_decay"           : 0.999,
     "awp_lr"              : 1e-4,
     "awp_eps"             : 1e-2,
-    "awp_start_epoch"     : 1,        # epoch 2부터 AWP (0-indexed)
+    "awp_start_epoch"     : 1,        # AWP from epoch 2 (0-indexed)
     "max_grouped_targets" : 5,
 }
 
@@ -62,14 +62,14 @@ seed_everything(CFG["seed"])
 torch.backends.cudnn.benchmark = True
 print(f"Device: {CFG['device']}", flush=True)
 
-# ── 데이터 로드 ───────────────────────────────────────────────
+# ── Load data ─────────────────────────────────────────────────
 z     = zipfile.ZipFile(CFG["data_path"])
 train = pd.read_csv(io.BytesIO(z.read("train.csv")))
 test  = pd.read_csv(io.BytesIO(z.read("test.csv")))
 sub   = pd.read_csv(io.BytesIO(z.read("sample_submission.csv")))
 print(f"Train: {train.shape}, Test: {test.shape}", flush=True)
 
-# ── CPC 섹션 설명 매핑 ──────────────────────────────────────
+# ── CPC section description map ──────────────────────────────
 CPC_SECTION = {
     'A': 'human necessities',
     'B': 'performing operations transporting',
@@ -86,7 +86,7 @@ def expand_cpc(code):
     section = str(code)[0].upper() if pd.notna(code) and len(str(code)) > 0 else ''
     return CPC_SECTION.get(section, str(code))
 
-# ── 토크나이저 ────────────────────────────────────────────────
+# ── Tokenizer ─────────────────────────────────────────────────
 tokenizer = DebertaV2Tokenizer.from_pretrained(CFG["model_name"])
 
 # ── Target Groupby ────────────────────────────────────────────
@@ -122,7 +122,7 @@ class PatentDataset(Dataset):
         else:
             texts_b = df["target"].tolist()
 
-        print(f"  토큰화 중... ({len(texts_a)}개)", flush=True)
+        print(f"  Tokenizing... ({len(texts_a)} samples)", flush=True)
         enc = tokenizer(
             texts_a, texts_b,
             max_length=CFG["max_length"],
@@ -180,7 +180,7 @@ class EMA:
         self.backup = {}
 
 # ── AWP (Adversarial Weight Perturbation) ────────────────────
-# attack은 gradient '방향'만 사용(norm 정규화)하므로 GradScaler의 scale과 무관.
+# attack uses only the gradient direction (norm-normalized), so it is independent of GradScaler scaling.
 class AWP:
     def __init__(self, model, adv_lr=1e-4, adv_eps=1e-2):
         self.model   = model
@@ -209,7 +209,7 @@ class AWP:
                 param.data = self.backup[name]
         self.backup = {}
 
-# ── 모델 (BI-LSTM header) ─────────────────────────────────────
+# ── Model (BiLSTM head) ───────────────────────────────────────
 class PatentModel(nn.Module):
     def __init__(self, model_name):
         super().__init__()
@@ -231,7 +231,7 @@ class PatentModel(nn.Module):
         pooled   = (lstm_out * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
         return torch.sigmoid(self.regressor(self.dropout(pooled))).squeeze(-1)
 
-# ── 학습 함수 (EMA + 경량 step ckpt) ───────────────────────────
+# ── Training loop (EMA + lightweight step ckpt) ───────────────
 def train_one_epoch(model, loader, optimizer, scheduler, scaler, ema, awp,
                     epoch, fold, best_pearson, start_step=0):
     model.train()
@@ -246,7 +246,7 @@ def train_one_epoch(model, loader, optimizer, scheduler, scaler, ema, awp,
 
     loader_iter = iter(loader)
     if start_step > 0:
-        print(f"  {start_step} steps 건너뜀...", flush=True)
+        print(f"  skipping {start_step} steps...", flush=True)
         for _ in range(start_step):
             next(loader_iter)
 
@@ -267,13 +267,13 @@ def train_one_epoch(model, loader, optimizer, scheduler, scaler, ema, awp,
         scaler.scale(loss).backward()
 
         if (step + 1) % CFG["grad_accum"] == 0:
-            # AWP: awp_start_epoch부터 adversarial weight perturbation
+            # AWP: adversarial weight perturbation from awp_start_epoch
             if epoch >= CFG["awp_start_epoch"]:
                 awp.attack()
                 with torch.cuda.amp.autocast():
                     preds_adv = model(input_ids, attention_mask, token_type_ids)
                     loss_adv  = criterion(preds_adv, labels) / CFG["grad_accum"]
-                scaler.scale(loss_adv).backward()   # adversarial grad 누적
+                scaler.scale(loss_adv).backward()   # accumulate adversarial grad
                 awp.restore()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -321,7 +321,7 @@ def predict(model, loader, ema=None):
         ema.restore()
     return np.concatenate(preds)
 
-# ── 체크포인트 ────────────────────────────────────────────────
+# ── Checkpoint ────────────────────────────────────────────────
 def load_progress():
     if os.path.exists(PROGRESS_FILE):
         with open(PROGRESS_FILE) as f:
@@ -332,7 +332,7 @@ def save_progress(progress):
     with open(PROGRESS_FILE, "w") as f:
         json.dump(progress, f, indent=2)
 
-# ── K-Fold 학습 ───────────────────────────────────────────────
+# ── K-Fold training ───────────────────────────────────────────
 train["label"] = (train["score"] * 4).round().astype(int)
 skf         = StratifiedKFold(n_splits=CFG["n_folds"], shuffle=True, random_state=CFG["seed"])
 fold_splits = list(skf.split(train, train["label"]))
@@ -362,11 +362,11 @@ for fold_str, fold_info in completed_folds.items():
         oof_preds[val_idx] = np.load(oof_path)
         test_preds        += np.load(test_path)
         n_folds_used      += 1
-        print(f"Fold {fold} 로드 (pearson={fold_info['pearson']:.4f})", flush=True)
+        print(f"Loaded fold {fold} (pearson={fold_info['pearson']:.4f})", flush=True)
 
 for fold in CFG["train_folds"]:
     if str(fold) in completed_folds:
-        print(f"Fold {fold} 이미 완료, 건너뜀", flush=True)
+        print(f"Fold {fold} already done, skipping", flush=True)
         continue
 
     tr_idx, val_idx = fold_splits[fold]
@@ -417,7 +417,7 @@ for fold in CFG["train_folds"]:
         fast_steps = start_epoch * (len(tr_loader) // CFG["grad_accum"])
         for _ in range(fast_steps):
             scheduler.step()
-        print(f"  Step ckpt: Epoch {start_epoch+1} Step {start_step}부터 재시작", flush=True)
+        print(f"  Step ckpt: resuming from Epoch {start_epoch+1} Step {start_step}", flush=True)
     elif os.path.exists(epoch_ckpt_path):
         ckpt = torch.load(epoch_ckpt_path, map_location=CFG["device"], weights_only=False)
         model.load_state_dict(ckpt["model"])
@@ -427,7 +427,7 @@ for fold in CFG["train_folds"]:
         fast_steps = start_epoch * (len(tr_loader) // CFG["grad_accum"])
         for _ in range(fast_steps):
             scheduler.step()
-        print(f"  Epoch ckpt: Epoch {start_epoch+1}부터 재시작 (best={best_pearson:.4f})", flush=True)
+        print(f"  Epoch ckpt: resuming from Epoch {start_epoch+1} (best={best_pearson:.4f})", flush=True)
 
     for epoch in range(start_epoch, CFG["epochs"]):
         print(f"\n[Fold {fold} | Epoch {epoch+1}/{CFG['epochs']}]", flush=True)
@@ -448,7 +448,7 @@ for fold in CFG["train_folds"]:
             ema.apply_shadow()
             torch.save(model.state_dict(), best_ckpt_path)
             ema.restore()
-            print(f"  → Best 저장 (pearson={best_pearson:.4f})", flush=True)
+            print(f"  → Best saved (pearson={best_pearson:.4f})", flush=True)
 
         torch.save({
             "epoch"       : epoch,
@@ -457,13 +457,13 @@ for fold in CFG["train_folds"]:
             "best_pearson": best_pearson,
         }, epoch_ckpt_path)
 
-    # best_ckpt가 있으면 로드, 없으면(끊김/정리로 유실) 현재 메모리 model 사용
+    # load best_ckpt if present; otherwise (lost to disconnect/cleanup) use current in-memory model
     if os.path.exists(best_ckpt_path):
         model.load_state_dict(torch.load(best_ckpt_path, map_location=CFG["device"], weights_only=False))
-        print("Best 모델 로드", flush=True)
+        print("Best model loaded", flush=True)
     else:
-        print(f"⚠️ best_ckpt 없음 — 현재 메모리 model(EMA shadow 적용)로 예측", flush=True)
-        ema.apply_shadow()   # EMA 가중치로 예측 (val_pearson을 낸 그 가중치)
+        print(f"[warn] best_ckpt missing - predicting with current in-memory model (EMA shadow applied)", flush=True)
+        ema.apply_shadow()   # predict with EMA weights (the weights that produced val_pearson)
     fold_oof  = predict(model, val_loader)
     fold_test = predict(model, test_loader)
 
@@ -487,17 +487,17 @@ for fold in CFG["train_folds"]:
     gc.collect()
     torch.cuda.empty_cache()
 
-    print(f"\nFold {fold} 완료. Best pearson={best_pearson:.4f}", flush=True)
+    print(f"\nFold {fold} done. Best pearson={best_pearson:.4f}", flush=True)
 
-# ── OOF 점수 ─────────────────────────────────────────────────
+# ── OOF score ─────────────────────────────────────────────────
 used_idx    = np.concatenate([fold_splits[f][1] for f in CFG["train_folds"]
                                if str(f) in completed_folds])
 oof_pearson = stats.pearsonr(train.iloc[used_idx]["score"].values, oof_preds[used_idx])[0]
 print(f"\nOOF Pearson: {oof_pearson:.4f}")
 
-# ── 제출 파일 ─────────────────────────────────────────────────
+# ── Submission file ───────────────────────────────────────────
 sub["score"] = test_preds / n_folds_used
 sub["score"] = sub["score"].clip(0, 1)
 sub.to_csv("predictions.csv", index=False)
-print("predictions.csv 저장 완료!")
+print("predictions.csv saved!")
 print(sub.head())
